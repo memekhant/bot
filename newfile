@@ -1,0 +1,261 @@
+# bot.py
+import discord
+from discord.ext import commands
+import os
+import json
+import logging
+import re
+import requests
+from discord_ui import *
+from report import Report
+from moderator import ModReport
+from difflib import SequenceMatcher
+import spacy
+
+client=commands.Bot(command_prefix=commands.when_mentioned_or("."))
+nlp = spacy.load("en_core_web_lg")
+ui = UI(client)
+
+# Set up logging to the console
+logger = logging.getLogger('discord')
+logger.setLevel(logging.DEBUG)
+handler = logging.FileHandler(
+    filename='discord.log', encoding='utf-8', mode='w')
+handler.setFormatter(logging.Formatter(
+    '%(asctime)s:%(levelname)s:%(name)s: %(message)s'))
+logger.addHandler(handler)
+
+# There should be a file called 'token.json' inside the same folder as this file
+token_path = 'tokens.json'
+if not os.path.isfile(token_path):
+    raise Exception(f"{token_path} not found!")
+with open(token_path) as f:
+    # If you get an error here, it means your token is formatted incorrectly. Did you put it in quotes?
+    tokens = json.load(f)
+    discord_token = tokens['discord']
+    perspective_key = tokens['perspective']
+
+
+class ModBot(discord.Client):
+    def __init__(self, key):
+        intents = discord.Intents.default()
+        super().__init__(command_prefix='.', intents=intents)
+        self.group_num = None
+        self.mod_channels = {}  # Map from guild to the mod channel id for that guild
+        self.reports = {}  # Map from user IDs to the state of their report
+        # Queue of reports that the moderator needs to address, from user flow or automated
+        self.modqueue = []
+        self.perspective_key = key
+        self.strike = {}  # Map user IDs to the number of warnings they have received
+        self.banned_users = []  # Keep track of banned users
+        self.CLIMATE_KEYWORDS = ["climate change", "CO2", "carbon emissions", "greenhouse gas", "carbon dioxide",
+                                 "renewable energy", "rising sea levels", "global warming", "sea levels",
+                                 "fossil fuels", "climate science", "renewable energy", "melting icebergs",
+                                 "climate action", "#CO2isGOOD4You!", "#RealGreenNotFakeGreen!",
+                                 "#Action4Life!", "#savetheplanet", "save the trees", "water pollution",
+                                 "#climatechangeisahoax", "Green New Deal", "#climatechangeisfake", "climate strike",
+                                 "#fridaysforfuture", "#gretathunberg"]
+
+    async def on_ready(self):
+        print(f'{self.user.name} has connected to Discord! It is these guilds:')
+        for guild in self.guilds:
+            print(f' - {guild.name}')
+        print('Press Ctrl-C to quit.')
+
+        # Parse the group number out of the bot's name
+        match = re.search('[gG]roup (\d+) [bB]ot', self.user.name)
+        if match:
+            self.group_num = match.group(1)
+        else:
+            raise Exception(
+                "Group number not found in bot's name. Name format should be \"Group # Bot\".")
+
+        # Find the mod channel in each guild that this bot should report to
+        for guild in self.guilds:
+            for channel in guild.text_channels:
+                if channel.name == f'group-{self.group_num}-mod':
+                    self.mod_channels[guild.id] = channel
+
+    async def on_message(self, message):
+        '''
+        This function is called whenever a message is sent in a channel that the bot can see (including DMs).
+        Currently the bot is configured to only handle messages that are sent over DMs or
+        in your group's "group-#" channel.
+        '''
+        # Ignore messages from us
+        if message.author.id == self.user.id:
+            return
+
+        # Check if this message was sent in a server ("guild") or if it's a DM
+        if message.guild and message.channel.name == f'group-{self.group_num}':
+            await self.handle_channel_message(message)
+        elif message.guild and message.channel.name == f'group-{self.group_num}-mod':
+            await self.handle_moderator_message(message)
+        else:
+            await self.handle_dm(message)
+
+    async def handle_dm(self, message):
+        # Handle a help message
+        if message.content == Report.HELP_KEYWORD:
+            reply = "Use the `report` command to begin the reporting process.\n"
+            reply += "Use the `cancel` command to cancel the report process.\n"
+            await message.channel.send(reply)
+            return
+
+    async def handle_moderator_message(self, message):
+        print(self.modqueue)
+        if len(self.modqueue) > 0:
+            status = await self.modqueue[0].handle_moderator_message(message)
+            if status == "done":
+                self.modqueue.pop()
+        else:
+            await message.channel.send("There are no reports for you to moderate.")
+
+    async def handle_channel_message(self, message):
+
+        '''
+        This function automatically detects hateful and harrassing content in messages sent to the group-# channel,
+        using Perspective API. If a message is flagged as toxic or harmful by perspective API,
+        the message is taken down and the user is warned up to 3 times. If the user continues to send hateful content
+        even after the third warning, the user is then banned from the platform.
+        '''
+
+        # Only handle messages sent in the "group-#" channel
+        if not message.channel.name == f'group-{self.group_num}':
+            return
+
+        mod_channel = self.mod_channels[message.guild.id]
+
+        scores = self.eval_text(message)
+        author_id = message.author.id
+        strike = 0
+        reply = "Warning: Your message violates our policy." \
+                "You'll be suspended from the platform if you continue this behaviour.\n "
+
+        # Identify if the user is a banned user or not
+        if author_id in self.banned_users:
+            await message.add_reaction("☠️")
+            # await message.channel.purge(limit=1) - this take down the message
+            await message.channel.send("You have been banned and are not welcomed on this platform.",
+            components_to_dict()
+            ])
+
+        # await mod_channel.send(self.code_format(json.dumps(scores, indent=2)))
+        # If a message has a toxicity score higher than threshold,
+        # User is given warning up to three times. After 3 times, user is banned from the platform
+
+        if (scores['SEVERE_TOXICITY'] >= 0.70 or scores['TOXICITY'] >= 0.70 or scores['IDENTITY_ATTACK'] >= 0.70 or
+            scores['THREAT'] >= 0.70 or scores['PROFANITY'] >= 0.70) and scores['FLIRTATION'] <= 0.60:
+            await mod_channel.send(
+                f'Potential Policy violation, Forwarded Message:\n{message.author.name}: "{message.content}"')
+
+            response = []
+            await mod_channel.send(self.code_format(json.dumps(scores, indent=2)))
+            if author_id not in self.strike:
+                self.strike[author_id] = strike + 1
+                await message.add_reaction("❌")
+                # await message.channel.purge(limit=1) - this take down the message
+                await message.channel.send(reply, components=[
+                    [LinkButton(
+                        url="https://docs.google.com/forms/d/e/1FAIpQLSfn0PUcDg8cN5qmQYoBAHDRmIFEzhtTEwRDQktq61ZK5qMolg/viewform?usp=sf_link",
+                        label="You can petition to dispute our decision here.", disabled=False)],
+                    [LinkButton(url="https://discord.com/safety/360043709612-Our-policies",
+                                label="Click here for more information.",
+                                disabled=False)]])
+            else:
+                self.strike[author_id] += 1
+                if self.strike[author_id] <= 3:
+                    await message.add_reaction("❌")
+                    # await message.channel.purge(limit=1) - this take down the message
+                    await message.channel.send(reply, components=[
+                        [LinkButton(
+                            url="https://docs.google.com/forms/d/e/1FAIpQLSfn0PUcDg8cN5qmQYoBAHDRmIFEzhtTEwRDQktq61ZK5qMolg/viewform?usp=sf_link",
+                            label="You can petition to dispute our decision here.", disabled=False)],
+                        [LinkButton(url="https://discord.com/safety/360043709612-Our-policies",
+                                    label="Click here for more information.", disabled=False)]
+                    ])
+                else:
+                    await message.add_reaction("☠️")
+                    await message.channel.send("You have repeatedly violated our policy despite warnings."
+                                               "\n According to our policy, you have been banned from this platform.",
+                                               components=[
+                                                   [LinkButton(
+                                                       url="https://docs.google.com/forms/d/e/1FAIpQLScnOS6ruPVVRiGot3YUYqImo8JDHZofM4lVZT4B5cLHaZ3EjA/viewform?usp=sf_link",
+                                                       label="You can petition to retrieve your account.",
+                                                       disabled=False)],
+                                                   [LinkButton(
+                                                       url="https://discord.com/safety/360043709612-Our-policies",
+                                                       label="Click here for more information.", disabled=False)]
+                                               ])
+                    self.banned_users.append(author_id)
+                    # the next step is for banned users, we can iterate through the channel and
+                    # delete all their previous messages and prevent them from sending new ones (using purge() function)
+
+
+        # Search for climate change keywords in a message
+        # This is a flawed system that only detect climated related words that can return a lot of false positives
+        # Detection is to be implemented with a more sophisticated system that classify the topic more accurately
+        for keyword in self.CLIMATE_KEYWORDS:
+            if keyword in message.content:
+                if self.is_climate_content(message.content) == True:
+                    await message.add_reaction("🌎")
+                    await mod_channel.send(f'Content Potentially related to Climate Change Disinformation, '
+                                           f':\n{message.author.name}: "{message.content}"')
+                    break  # break here
+
+
+    # Compare the key phrases to a list of keywords
+    def is_climate_content(text):
+        keywords = get_phrases(text)
+        index = 0
+        list_match = []
+        for keyword in keywords:
+            s = SequenceMatcher(None, keyword, CLIMATE_KEYWORDS[index])
+            if s.ratio() > 0.6:
+                list_match.append(keyword[index])
+                list_match.append(keyword)
+
+        if len(list_match) >= 5:
+            return True
+
+    # Get key phrases out of a text
+    def get_phrases(text):
+        result = []
+        doc = nlp(text.lower())
+
+        for chunk in doc.noun_chunks:
+            result.append(chunk.text)
+        return set(result)
+
+    def eval_text(self, message):
+        '''
+        Given a message, forwards the message to Perspective and returns a dictionary of scores.
+        '''
+        PERSPECTIVE_URL = 'https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze'
+
+        url = PERSPECTIVE_URL + '?key=' + self.perspective_key
+        data_dict = {
+            'comment': {'text': message.content},
+            'languages': ['en'],
+            'requestedAttributes': {
+                'SEVERE_TOXICITY': {}, 'PROFANITY': {},
+                'IDENTITY_ATTACK': {}, 'THREAT': {},
+                'TOXICITY': {}, 'FLIRTATION': {}
+            },
+            'doNotStore': True
+        }
+        response = requests.post(url, data=json.dumps(data_dict))
+        response_dict = response.json()
+
+        scores = {}
+        for attr in response_dict["attributeScores"]:
+            scores[attr] = response_dict["attributeScores"][attr]["summaryScore"]["value"]
+
+        return scores
+
+    def code_format(self, text):
+        return "```" + text + "```"
+
+
+client = ModBot(perspective_key)
+client.run(discord_token)
